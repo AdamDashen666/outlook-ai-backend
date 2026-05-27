@@ -1,10 +1,19 @@
 import { ImapFlow } from "imapflow";
 import { simpleParser } from "mailparser";
 
+const IMAP_PREVIEW_BYTES = Number(process.env.IMAP_PREVIEW_BYTES || 12000);
+const BODY_PREVIEW_CHARS = Number(process.env.BODY_PREVIEW_CHARS || 1500);
+
 function boolEnv(name, fallback = false) {
   const value = process.env[name];
   if (value === undefined || value === "") return fallback;
   return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
+}
+
+function positiveInt(value, fallback, max) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) return fallback;
+  return Math.min(Math.floor(number), max);
 }
 
 export function isImapConfigured() {
@@ -62,6 +71,14 @@ function firstAddress(addressObject) {
   };
 }
 
+function firstEnvelopeAddress(addresses) {
+  const value = Array.isArray(addresses) ? addresses[0] : null;
+  return {
+    name: value?.name || value?.address || "未知发件人",
+    address: value?.address || ""
+  };
+}
+
 function parseAddressLine(value = "") {
   const line = String(value).trim().replace(/^"|"$/g, "");
   const angle = line.match(/^(.*?)\s*<([^>]+)>/);
@@ -101,6 +118,45 @@ function cleanSubject(subject = "") {
     .trim() || "无标题";
 }
 
+function toDate(value, fallback = new Date()) {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value;
+  const parsed = value ? new Date(value) : fallback;
+  return Number.isNaN(parsed.getTime()) ? fallback : parsed;
+}
+
+function sourceToString(source) {
+  if (!source) return "";
+  if (Buffer.isBuffer(source)) return source.toString("utf8");
+  return String(source);
+}
+
+async function parsePreview(source) {
+  const raw = sourceToString(source);
+  if (!raw) return { text: "", original: extractForwardedMeta("") };
+
+  try {
+    const parsed = await simpleParser(Buffer.from(raw));
+    const text = (parsed.text || htmlToText(parsed.html || "") || raw)
+      .replace(/\s+/g, " ")
+      .trim();
+
+    return {
+      text,
+      original: extractForwardedMeta(text),
+      parsedFrom: firstAddress(parsed.from),
+      parsedSubject: cleanSubject(parsed.subject || "")
+    };
+  } catch {
+    const text = htmlToText(raw).replace(/\s+/g, " ").trim();
+    return {
+      text,
+      original: extractForwardedMeta(text),
+      parsedFrom: { name: "未知发件人", address: "" },
+      parsedSubject: ""
+    };
+  }
+}
+
 export async function testImapConnection() {
   if (!isImapConfigured()) {
     return { ok: false, error: "IMAP is not configured" };
@@ -135,72 +191,188 @@ export async function testImapConnection() {
   }
 }
 
-async function fetchUnseenFromMailbox(client, mailbox, sourceFolder) {
+async function fetchUnseenCandidatesFromMailbox(client, mailbox, sourceFolder, options = {}) {
+  const { cutoffDate = null, candidateLimit = 31 } = options;
   const lock = await client.getMailboxLock(mailbox);
+
   try {
-    const uids = await client.search({ seen: false }, { uid: true });
-    if (!uids.length) return [];
+    const searchQuery = { seen: false };
+    if (cutoffDate) searchQuery.since = cutoffDate;
 
-    const messages = [];
-    for await (const item of client.fetch(uids, { uid: true, source: true, envelope: true, flags: true }, { uid: true })) {
-      const parsed = await simpleParser(item.source);
-      const text = (parsed.text || htmlToText(parsed.html || "")).trim();
-      const original = extractForwardedMeta(text);
-      const parsedFrom = firstAddress(parsed.from);
-      const from = original.from || parsedFrom;
-      const subject = original.subject || cleanSubject(parsed.subject || "");
-      const received = parsed.date instanceof Date ? parsed.date.toISOString() : new Date().toISOString();
+    const uids = await client.search(searchQuery, { uid: true });
+    if (!uids.length) return { candidates: [], hasMore: false };
 
-      messages.push({
+    const recentUids = [...uids]
+      .sort((a, b) => Number(b) - Number(a))
+      .slice(0, candidateLimit);
+
+    const candidates = [];
+    for await (const item of client.fetch(recentUids, {
+      uid: true,
+      envelope: true,
+      internalDate: true,
+      flags: true,
+      size: true
+    }, { uid: true })) {
+      const receivedDate = toDate(item.envelope?.date || item.internalDate);
+      if (cutoffDate && receivedDate.getTime() < cutoffDate.getTime()) continue;
+
+      const from = firstEnvelopeAddress(item.envelope?.from);
+      candidates.push({
         id: `imap_${mailbox}_${item.uid}`,
         uid: item.uid,
         mailbox,
         sourceFolder,
-        subject,
+        subject: cleanSubject(item.envelope?.subject || ""),
         from: {
           emailAddress: {
-            name: from.name || from.address || parsedFrom.name,
-            address: from.address || parsedFrom.address
+            name: from.name,
+            address: from.address
           }
         },
-        receivedDateTime: received,
-        bodyPreview: text.slice(0, 6000),
-        originalForwarded: Boolean(original.from || original.subject),
+        receivedDateTime: receivedDate.toISOString(),
+        bodyPreview: "",
+        originalForwarded: false,
         originalHeaders: {
-          from: original.from,
-          subject: original.subject || "",
-          date: original.date || "",
-          to: original.to || ""
+          from: null,
+          subject: "",
+          date: "",
+          to: ""
         }
       });
     }
-    return messages;
+
+    return {
+      candidates,
+      hasMore: uids.length > recentUids.length
+    };
   } finally {
     lock.release();
   }
 }
 
-export async function getUnreadImapMessages() {
-  if (!isImapConfigured()) return [];
+async function attachPreviews(client, messages) {
+  const byMailbox = new Map();
+  for (const message of messages) {
+    if (!byMailbox.has(message.mailbox)) byMailbox.set(message.mailbox, []);
+    byMailbox.get(message.mailbox).push(message);
+  }
+
+  for (const [mailbox, mailboxMessages] of byMailbox.entries()) {
+    const lock = await client.getMailboxLock(mailbox);
+
+    try {
+      const uidSet = new Set(mailboxMessages.map(message => Number(message.uid)));
+      const messageByUid = new Map(mailboxMessages.map(message => [Number(message.uid), message]));
+
+      for await (const item of client.fetch([...uidSet], {
+        uid: true,
+        source: {
+          start: 0,
+          maxLength: IMAP_PREVIEW_BYTES
+        }
+      }, { uid: true })) {
+        const target = messageByUid.get(Number(item.uid));
+        if (!target) continue;
+
+        const preview = await parsePreview(item.source);
+        const original = preview.original || {};
+        const originalFrom = original.from;
+        const fallbackFrom = preview.parsedFrom || target.from.emailAddress;
+
+        target.bodyPreview = (preview.text || "").slice(0, BODY_PREVIEW_CHARS);
+        target.originalForwarded = Boolean(original.from || original.subject);
+        target.originalHeaders = {
+          from: original.from || null,
+          subject: original.subject || "",
+          date: original.date || "",
+          to: original.to || ""
+        };
+
+        if (original.subject || preview.parsedSubject) {
+          target.subject = cleanSubject(original.subject || preview.parsedSubject || target.subject);
+        }
+
+        if (originalFrom || fallbackFrom) {
+          target.from = {
+            emailAddress: {
+              name: originalFrom?.name || fallbackFrom?.name || target.from.emailAddress.name,
+              address: originalFrom?.address || fallbackFrom?.address || target.from.emailAddress.address
+            }
+          };
+        }
+      }
+    } finally {
+      lock.release();
+    }
+  }
+
+  return messages;
+}
+
+export async function getUnreadImapMessagesForSummary(options = {}) {
+  if (!isImapConfigured()) return { messages: [], hasMore: false };
+
+  const mode = options.mode === "test" ? "test" : "scheduled";
+  const limit = mode === "test"
+    ? positiveInt(options.limit, 3, 5)
+    : positiveInt(options.maxMessages, 30, 100);
+  const windowHours = mode === "scheduled"
+    ? positiveInt(options.windowHours, 24, 24 * 60)
+    : null;
+  const cutoffDate = windowHours ? new Date(Date.now() - windowHours * 60 * 60 * 1000) : null;
+  const candidateLimit = limit + 1;
+
   const client = createClient();
   const info = getImapAccountInfo();
   await client.connect();
+
   try {
-    const all = [];
-    all.push(...await fetchUnseenFromMailbox(client, info.inboxMailbox, "inbox"));
+    const allCandidates = [];
+    let hasMore = false;
+
+    const inboxResult = await fetchUnseenCandidatesFromMailbox(client, info.inboxMailbox, "inbox", {
+      cutoffDate,
+      candidateLimit
+    });
+    allCandidates.push(...inboxResult.candidates);
+    hasMore = hasMore || inboxResult.hasMore;
+
     if (info.junkMailbox) {
       try {
-        all.push(...await fetchUnseenFromMailbox(client, info.junkMailbox, "junkemail"));
+        const junkResult = await fetchUnseenCandidatesFromMailbox(client, info.junkMailbox, "junkemail", {
+          cutoffDate,
+          candidateLimit
+        });
+        allCandidates.push(...junkResult.candidates);
+        hasMore = hasMore || junkResult.hasMore;
       } catch (err) {
         console.warn(`Unable to scan junk mailbox ${info.junkMailbox}:`, err.message);
       }
     }
-    const map = new Map();
-    for (const msg of all) map.set(msg.id, msg);
-    return [...map.values()];
+
+    allCandidates.sort((a, b) => new Date(b.receivedDateTime) - new Date(a.receivedDateTime));
+    if (allCandidates.length > limit) hasMore = true;
+
+    const selected = allCandidates.slice(0, limit);
+    await attachPreviews(client, selected);
+
+    return {
+      messages: selected,
+      hasMore
+    };
   } finally {
     await client.logout().catch(() => {});
   }
+}
+
+export async function getUnreadImapMessages(options = {}) {
+  const { messages } = await getUnreadImapMessagesForSummary({
+    mode: "scheduled",
+    windowHours: options.windowHours || 24,
+    maxMessages: options.maxMessages || 30
+  });
+  return messages;
 }
 
 export async function markImapMessageSummarized(message) {
