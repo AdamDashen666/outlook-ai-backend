@@ -16,7 +16,7 @@ import {
   isImapConfigured,
   getImapAccountInfo,
   testImapConnection,
-  getUnreadImapMessages,
+  getUnreadImapMessagesForSummary,
   markImapMessageSummarized,
   cleanupImapMessages
 } from "./imapMail.js";
@@ -45,6 +45,62 @@ function trimPushBody(text) {
 function stripAiSettings(settings = {}) {
   const { aiModel, aiBaseUrl, aiApiKey, aiApi, ...safeSettings } = settings || {};
   return safeSettings;
+}
+
+function positiveInt(value, fallback, max) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) return fallback;
+  return Math.min(Math.floor(number), max);
+}
+
+function getScheduledOptionsForUser(user) {
+  const frequency = user?.settings?.frequency || "daily";
+  if (frequency === "sixHours") {
+    return { mode: "scheduled", windowHours: 6, maxMessages: 30 };
+  }
+  if (frequency === "monthly") {
+    return { mode: "scheduled", windowHours: 720, maxMessages: 50 };
+  }
+  return { mode: "scheduled", windowHours: 24, maxMessages: 30 };
+}
+
+function normalizeSummaryOptions(body = {}, user = null) {
+  const mode = body.mode === "scheduled" ? "scheduled" : "test";
+
+  if (mode === "test") {
+    return {
+      mode: "test",
+      limit: positiveInt(body.limit, 3, 5)
+    };
+  }
+
+  const defaults = getScheduledOptionsForUser(user);
+  return {
+    mode: "scheduled",
+    windowHours: positiveInt(body.windowHours, defaults.windowHours, 24 * 60),
+    maxMessages: positiveInt(body.maxMessages, defaults.maxMessages, 100)
+  };
+}
+
+function filterMessagesByWindow(messages, options) {
+  const mode = options.mode === "test" ? "test" : "scheduled";
+  const limit = mode === "test" ? positiveInt(options.limit, 3, 5) : positiveInt(options.maxMessages, 30, 100);
+  const cutoff = mode === "scheduled"
+    ? Date.now() - positiveInt(options.windowHours, 24, 24 * 60) * 60 * 60 * 1000
+    : null;
+
+  const filtered = messages
+    .filter(message => {
+      if (!cutoff) return true;
+      const receivedAt = new Date(message.receivedDateTime || 0).getTime();
+      return Number.isFinite(receivedAt) && receivedAt >= cutoff;
+    })
+    .sort((a, b) => new Date(b.receivedDateTime || 0) - new Date(a.receivedDateTime || 0));
+
+  return {
+    messages: filtered.slice(0, limit),
+    hasMore: filtered.length > limit
+  };
 }
 
 async function getFreshAccessToken(user, store) {
@@ -305,66 +361,118 @@ app.post("/summarize/run", async (req, res) => {
     const { deviceId } = req.body || {};
     const store = loadStore();
     const device = store.devices[deviceId];
-    if (!device?.userId) return res.status(400).json({ error: "Device not linked" });
+    if (!device?.userId) return res.status(400).json({ ok: false, error: "Device not linked" });
+
     const user = store.users[device.userId];
-    const summary = await runSummaryForUser(user, device, store);
+    const options = normalizeSummaryOptions(req.body || {}, user);
+    const result = await runSummaryForUser(user, device, store, options);
+
     saveStore(store);
-    res.json({ ok: true, summary });
+
+    if (!result.ok && result.processed === 0) {
+      return res.json({
+        ok: false,
+        mode: result.mode,
+        processed: 0,
+        message: result.message || "没有可总结的新邮件"
+      });
+    }
+
+    res.json({
+      ok: true,
+      mode: result.mode,
+      processed: result.processed,
+      summary: result.content,
+      hasMore: result.hasMore,
+      summaryId: result.summaryRecord?.id
+    });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: err.message });
+    res.json({ ok: false, error: err.message });
   }
 });
 
-async function runSummaryForUser(user, device, store) {
-  const messages = USE_IMAP ? await getUnreadImapMessages() : await getUnreadMessages(await getFreshAccessToken(user, store));
-  const summaryId = makeId("summary");
-  let content = "没有新的未读邮件。";
+async function getMessagesForSummary(user, store, options) {
+  if (USE_IMAP) {
+    return getUnreadImapMessagesForSummary(options);
+  }
 
-  if (messages.length > 0) {
-    content = await summarizeMessages(messages, user.settings);
-    for (const message of messages) {
-      try {
-        if (USE_IMAP) {
-          await markImapMessageSummarized(message);
-        } else {
-          const accessToken = await getFreshAccessToken(user, store);
-          await markMessageSummarized(accessToken, message);
-        }
+  const allMessages = await getUnreadMessages(await getFreshAccessToken(user, store));
+  return filterMessagesByWindow(allMessages, options);
+}
 
-        store.summarizedMessages[message.id] = {
-          userId: user.id,
-          messageId: message.id,
-          uid: message.uid,
-          mailbox: message.mailbox,
-          subject: message.subject,
-          webLink: message.webLink || "",
-          summarizedAt: nowIso(),
-          sourceFolder: message.sourceFolder,
-          provider: USE_IMAP ? "imap" : "graph"
-        };
-      } catch (err) {
-        console.warn("Failed to mark summarized", message.id, err.message);
+async function runSummaryForUser(user, device, store, options = getScheduledOptionsForUser(user)) {
+  const summaryOptions = options?.mode ? options : getScheduledOptionsForUser(user);
+  const { messages, hasMore } = await getMessagesForSummary(user, store, summaryOptions);
+  const mode = summaryOptions.mode === "test" ? "test" : "scheduled";
+  const processed = messages.length;
+
+  if (processed === 0) {
+    return {
+      ok: false,
+      mode,
+      processed: 0,
+      hasMore: false,
+      message: "没有可总结的新邮件"
+    };
+  }
+
+  const content = await summarizeMessages(messages, user.settings);
+
+  for (const message of messages) {
+    try {
+      if (USE_IMAP) {
+        await markImapMessageSummarized(message);
+      } else {
+        const accessToken = await getFreshAccessToken(user, store);
+        await markMessageSummarized(accessToken, message);
       }
+
+      store.summarizedMessages[message.id] = {
+        userId: user.id,
+        messageId: message.id,
+        uid: message.uid,
+        mailbox: message.mailbox,
+        subject: message.subject,
+        webLink: message.webLink || "",
+        summarizedAt: nowIso(),
+        sourceFolder: message.sourceFolder,
+        provider: USE_IMAP ? "imap" : "graph"
+      };
+    } catch (err) {
+      console.warn("Failed to mark summarized", message.id, err.message);
     }
   }
 
   const title = USE_IMAP ? "QQ 邮箱邮件总结" : "Outlook 邮件总结";
+  const summaryId = makeId("summary");
   const summary = {
     id: summaryId,
     userId: user.id,
     title,
     content,
-    unreadCount: messages.length,
+    mode,
+    processed,
+    hasMore,
+    unreadCount: processed,
     junkUnreadCount: messages.filter(m => m.sourceFolder === "junkemail").length,
+    windowHours: summaryOptions.windowHours || null,
     createdAt: nowIso()
   };
+
   store.summaries[summaryId] = summary;
   user.lastRunAt = nowIso();
   store.users[user.id] = user;
 
   await sendSummaryPush(device.deviceToken, title, trimPushBody(content), summaryId);
-  return summary;
+  return {
+    ok: true,
+    mode,
+    processed,
+    content,
+    hasMore,
+    summaryRecord: summary
+  };
 }
 
 async function cleanupForUser(user, store) {
@@ -424,7 +532,7 @@ async function schedulerTick() {
   for (const user of Object.values(store.users)) {
     const device = store.devices[user.deviceId];
     try {
-      if (isDue(user)) await runSummaryForUser(user, device || {}, store);
+      if (isDue(user)) await runSummaryForUser(user, device || {}, store, getScheduledOptionsForUser(user));
       await cleanupForUser(user, store);
     } catch (err) {
       console.error("Scheduled job failed", user.id, err.message);
