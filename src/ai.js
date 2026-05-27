@@ -1,7 +1,13 @@
+export function getAiConfig(settings = {}) {
+  return {
+    apiKey: process.env.AI_API_KEY || settings.aiApiKey,
+    baseUrl: process.env.AI_BASE_URL || settings.aiBaseUrl || "https://api.deepseek.com/chat/completions",
+    model: process.env.AI_MODEL || settings.aiModel || "deepseek-v4-flash"
+  };
+}
+
 export async function summarizeMessages(messages, settings = {}) {
-  const apiKey = settings.aiApiKey || process.env.AI_API_KEY;
-  const baseUrl = settings.aiBaseUrl || process.env.AI_BASE_URL || "https://api.openai.com/v1/chat/completions";
-  const model = settings.aiModel || process.env.AI_MODEL || "gpt-4o-mini";
+  const { apiKey, baseUrl, model } = getAiConfig(settings);
   if (!apiKey) throw new Error("Missing AI API key");
 
   const compactMessages = messages.map((m, index) => ({
