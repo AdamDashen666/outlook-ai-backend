@@ -20,7 +20,7 @@ import {
   markImapMessageSummarized,
   cleanupImapMessages
 } from "./imapMail.js";
-import { summarizeMessages } from "./ai.js";
+import { summarizeMessages, getAiConfig } from "./ai.js";
 import { sendSummaryPush } from "./push.js";
 import { loadStore, saveStore, updateStore, nowIso, isDue } from "./store.js";
 
@@ -40,6 +40,11 @@ function makeId(prefix) {
 
 function trimPushBody(text) {
   return text.replace(/[#*`>\-]/g, "").replace(/\s+/g, " ").slice(0, 160);
+}
+
+function stripAiSettings(settings = {}) {
+  const { aiModel, aiBaseUrl, aiApiKey, aiApi, ...safeSettings } = settings || {};
+  return safeSettings;
 }
 
 async function getFreshAccessToken(user, store) {
@@ -66,6 +71,71 @@ app.get("/imap/test", async (_, res) => {
   } catch (err) {
     console.error("IMAP test failed", err);
     res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/ai/test", async (_, res) => {
+  const { apiKey, baseUrl, model } = getAiConfig({});
+
+  if (!apiKey) {
+    return res.json({
+      ok: false,
+      model,
+      error: "Missing AI API key"
+    });
+  }
+
+  try {
+    const aiRes = await fetch(baseUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: "system", content: "你是一个健康检查助手。" },
+          { role: "user", content: "请只回复 OK" }
+        ],
+        temperature: 0
+      })
+    });
+
+    const responseText = await aiRes.text();
+
+    if (!aiRes.ok) {
+      return res.json({
+        ok: false,
+        model,
+        error: `AI test failed: ${aiRes.status} ${responseText}`
+      });
+    }
+
+    let data;
+    try {
+      data = JSON.parse(responseText);
+    } catch {
+      return res.json({
+        ok: false,
+        model,
+        error: `AI test returned non-JSON response: ${responseText.slice(0, 300)}`
+      });
+    }
+
+    res.json({
+      ok: true,
+      model,
+      message: "AI 模型连接正常",
+      reply: data.choices?.[0]?.message?.content?.trim() || ""
+    });
+  } catch (err) {
+    console.error("AI test failed", err);
+    res.json({
+      ok: false,
+      model,
+      error: err.message
+    });
   }
 });
 
@@ -103,8 +173,7 @@ app.post("/devices/register", (req, res) => {
           autoDeleteEnabled: true,
           deleteAfterDays: DELETE_AFTER_DAYS,
           permanentDeleteAfterDays: PERMANENT_DELETE_AFTER_DAYS,
-          aiModel: process.env.AI_MODEL || "gpt-4o-mini",
-          ...(store.users[userId]?.settings || {})
+          ...stripAiSettings(store.users[userId]?.settings || {})
         },
         updatedAt: nowIso()
       };
@@ -169,8 +238,7 @@ app.get("/auth/callback", async (req, res) => {
           includeJunkUnread: true,
           autoDeleteEnabled: true,
           deleteAfterDays: DELETE_AFTER_DAYS,
-          permanentDeleteAfterDays: PERMANENT_DELETE_AFTER_DAYS,
-          aiModel: process.env.AI_MODEL || "gpt-4o-mini"
+          permanentDeleteAfterDays: PERMANENT_DELETE_AFTER_DAYS
         },
         updatedAt: nowIso()
       };
@@ -193,7 +261,7 @@ app.get("/auth/status", (req, res) => {
     user: user ? {
       displayName: user.microsoft?.displayName || (user.provider === "qq" ? "QQ 邮箱" : user.imap?.email),
       email: user.microsoft?.mail || user.microsoft?.userPrincipalName || user.imap?.email,
-      settings: user.settings,
+      settings: stripAiSettings(user.settings),
       lastRunAt: user.lastRunAt
     } : null
   });
@@ -204,15 +272,16 @@ app.post("/settings", (req, res) => {
   const result = updateStore(store => {
     const device = store.devices[deviceId];
     if (!device?.userId || !store.users[device.userId]) throw new Error("Device not linked");
-    const current = store.users[device.userId].settings || {};
+    const current = stripAiSettings(store.users[device.userId].settings || {});
+    const safeSettings = stripAiSettings(settings);
     store.users[device.userId].settings = {
       ...current,
-      ...settings,
+      ...safeSettings,
       language: "zh-CN",
       includeJunkUnread: true,
-      autoDeleteEnabled: settings.autoDeleteEnabled ?? current.autoDeleteEnabled ?? true,
-      deleteAfterDays: Number(settings.deleteAfterDays || current.deleteAfterDays || DELETE_AFTER_DAYS),
-      permanentDeleteAfterDays: Number(settings.permanentDeleteAfterDays || current.permanentDeleteAfterDays || PERMANENT_DELETE_AFTER_DAYS)
+      autoDeleteEnabled: safeSettings.autoDeleteEnabled ?? current.autoDeleteEnabled ?? true,
+      deleteAfterDays: Number(safeSettings.deleteAfterDays || current.deleteAfterDays || DELETE_AFTER_DAYS),
+      permanentDeleteAfterDays: Number(safeSettings.permanentDeleteAfterDays || current.permanentDeleteAfterDays || PERMANENT_DELETE_AFTER_DAYS)
     };
     store.users[device.userId].updatedAt = nowIso();
     return store.users[device.userId].settings;
