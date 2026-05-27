@@ -12,6 +12,14 @@ import {
   moveToDeletedItems,
   permanentDelete
 } from "./graph.js";
+import {
+  isImapConfigured,
+  getImapAccountInfo,
+  testImapConnection,
+  getUnreadImapMessages,
+  markImapMessageSummarized,
+  cleanupImapMessages
+} from "./imapMail.js";
 import { summarizeMessages } from "./ai.js";
 import { sendSummaryPush } from "./push.js";
 import { loadStore, saveStore, updateStore, nowIso, isDue } from "./store.js";
@@ -23,6 +31,8 @@ const PORT = Number(process.env.PORT || 3000);
 const DELETE_AFTER_DAYS = Number(process.env.DELETE_AFTER_DAYS || 30);
 const PERMANENT_DELETE_AFTER_DAYS = Number(process.env.PERMANENT_DELETE_AFTER_DAYS || 7);
 const AUTO_DELETE_ENABLED = String(process.env.AUTO_DELETE_ENABLED ?? "true").toLowerCase() === "true";
+const MAIL_PROVIDER = String(process.env.MAIL_PROVIDER || "graph").toLowerCase();
+const USE_IMAP = MAIL_PROVIDER === "qq" || MAIL_PROVIDER === "imap";
 
 function makeId(prefix) {
   return `${prefix}_${crypto.randomBytes(12).toString("hex")}`;
@@ -45,19 +55,62 @@ async function getFreshAccessToken(user, store) {
 }
 
 app.get("/health", (_, res) => {
-  res.json({ ok: true, time: nowIso() });
+  res.json({ ok: true, time: nowIso(), provider: USE_IMAP ? "imap" : "graph" });
+});
+
+app.get("/imap/test", async (_, res) => {
+  try {
+    if (!USE_IMAP) return res.json({ ok: false, error: "MAIL_PROVIDER is not qq/imap" });
+    const result = await testImapConnection();
+    res.json(result);
+  } catch (err) {
+    console.error("IMAP test failed", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 app.post("/devices/register", (req, res) => {
   const { deviceId = makeId("device"), deviceToken = "", platform = "iOS" } = req.body || {};
   const result = updateStore(store => {
-    store.devices[deviceId] = {
+    const baseDevice = {
       ...(store.devices[deviceId] || {}),
       deviceId,
       deviceToken,
       platform,
       updatedAt: nowIso()
     };
+
+    if (USE_IMAP && isImapConfigured()) {
+      const info = getImapAccountInfo();
+      const userId = "imap_default_user";
+      baseDevice.userId = userId;
+      store.users[userId] = {
+        ...(store.users[userId] || {}),
+        id: userId,
+        deviceId,
+        provider: info.provider,
+        imap: {
+          email: info.email,
+          host: info.host,
+          inboxMailbox: info.inboxMailbox,
+          junkMailbox: info.junkMailbox
+        },
+        settings: {
+          enabled: true,
+          frequency: "daily",
+          language: "zh-CN",
+          includeJunkUnread: Boolean(info.junkMailbox),
+          autoDeleteEnabled: true,
+          deleteAfterDays: DELETE_AFTER_DAYS,
+          permanentDeleteAfterDays: PERMANENT_DELETE_AFTER_DAYS,
+          aiModel: process.env.AI_MODEL || "gpt-4o-mini",
+          ...(store.users[userId]?.settings || {})
+        },
+        updatedAt: nowIso()
+      };
+    }
+
+    store.devices[deviceId] = baseDevice;
     return store.devices[deviceId];
   });
   res.json(result);
@@ -66,6 +119,11 @@ app.post("/devices/register", (req, res) => {
 app.get("/auth/start", (req, res) => {
   const deviceId = String(req.query.deviceId || "");
   if (!deviceId) return res.status(400).send("Missing deviceId");
+
+  if (USE_IMAP) {
+    return res.send(`<!doctype html><meta name="viewport" content="width=device-width, initial-scale=1"><body style="font-family:-apple-system;padding:28px;background:#101827;color:white"><h2>QQ 邮箱模式</h2><p>此版本不需要 Microsoft 登录。请在 Render 环境变量里配置 IMAP_USER 和 IMAP_PASS，然后回到 App 点击刷新状态。</p></body>`);
+  }
+
   const state = crypto.randomBytes(16).toString("hex");
   updateStore(store => {
     store.authStates[state] = { deviceId, createdAt: nowIso() };
@@ -133,8 +191,8 @@ app.get("/auth/status", (req, res) => {
   res.json({
     linked: Boolean(user),
     user: user ? {
-      displayName: user.microsoft?.displayName,
-      email: user.microsoft?.mail || user.microsoft?.userPrincipalName,
+      displayName: user.microsoft?.displayName || (user.provider === "qq" ? "QQ 邮箱" : user.imap?.email),
+      email: user.microsoft?.mail || user.microsoft?.userPrincipalName || user.imap?.email,
       settings: user.settings,
       lastRunAt: user.lastRunAt
     } : null
@@ -190,8 +248,7 @@ app.post("/summarize/run", async (req, res) => {
 });
 
 async function runSummaryForUser(user, device, store) {
-  const accessToken = await getFreshAccessToken(user, store);
-  const messages = await getUnreadMessages(accessToken);
+  const messages = USE_IMAP ? await getUnreadImapMessages() : await getUnreadMessages(await getFreshAccessToken(user, store));
   const summaryId = makeId("summary");
   let content = "没有新的未读邮件。";
 
@@ -199,14 +256,23 @@ async function runSummaryForUser(user, device, store) {
     content = await summarizeMessages(messages, user.settings);
     for (const message of messages) {
       try {
-        await markMessageSummarized(accessToken, message);
+        if (USE_IMAP) {
+          await markImapMessageSummarized(message);
+        } else {
+          const accessToken = await getFreshAccessToken(user, store);
+          await markMessageSummarized(accessToken, message);
+        }
+
         store.summarizedMessages[message.id] = {
           userId: user.id,
           messageId: message.id,
+          uid: message.uid,
+          mailbox: message.mailbox,
           subject: message.subject,
-          webLink: message.webLink,
+          webLink: message.webLink || "",
           summarizedAt: nowIso(),
-          sourceFolder: message.sourceFolder
+          sourceFolder: message.sourceFolder,
+          provider: USE_IMAP ? "imap" : "graph"
         };
       } catch (err) {
         console.warn("Failed to mark summarized", message.id, err.message);
@@ -214,10 +280,11 @@ async function runSummaryForUser(user, device, store) {
     }
   }
 
+  const title = USE_IMAP ? "QQ 邮箱邮件总结" : "Outlook 邮件总结";
   const summary = {
     id: summaryId,
     userId: user.id,
-    title: "Outlook 邮件总结",
+    title,
     content,
     unreadCount: messages.length,
     junkUnreadCount: messages.filter(m => m.sourceFolder === "junkemail").length,
@@ -227,14 +294,19 @@ async function runSummaryForUser(user, device, store) {
   user.lastRunAt = nowIso();
   store.users[user.id] = user;
 
-  await sendSummaryPush(device.deviceToken, "Outlook 邮件总结", trimPushBody(content), summaryId);
+  await sendSummaryPush(device.deviceToken, title, trimPushBody(content), summaryId);
   return summary;
 }
 
 async function cleanupForUser(user, store) {
   if (!AUTO_DELETE_ENABLED || user.settings?.autoDeleteEnabled === false) return { skipped: true };
-  const accessToken = await getFreshAccessToken(user, store);
   const deleteAfter = Number(user.settings?.deleteAfterDays || DELETE_AFTER_DAYS);
+
+  if (USE_IMAP) {
+    return cleanupImapMessages(store, user, deleteAfter);
+  }
+
+  const accessToken = await getFreshAccessToken(user, store);
   const keepDeletedDays = Number(user.settings?.permanentDeleteAfterDays || PERMANENT_DELETE_AFTER_DAYS);
   const cutoff = Date.now() - deleteAfter * 24 * 60 * 60 * 1000;
   const moved = [];
@@ -243,7 +315,7 @@ async function cleanupForUser(user, store) {
   for (const message of oldRead) {
     try {
       await moveToDeletedItems(accessToken, message.id);
-      store.deletedMessages[message.id] = { userId: user.id, messageId: message.id, deletedAt: nowIso(), reason: "read_older_than_30_days" };
+      store.deletedMessages[message.id] = { userId: user.id, messageId: message.id, deletedAt: nowIso(), reason: "read_older_than_retention_days" };
       moved.push(message.id);
     } catch (err) {
       console.warn("Move read message failed", message.id, err.message);
@@ -255,7 +327,7 @@ async function cleanupForUser(user, store) {
     if (store.deletedMessages[record.messageId]) continue;
     try {
       await moveToDeletedItems(accessToken, record.messageId);
-      store.deletedMessages[record.messageId] = { userId: user.id, messageId: record.messageId, deletedAt: nowIso(), reason: "summarized_older_than_30_days" };
+      store.deletedMessages[record.messageId] = { userId: user.id, messageId: record.messageId, deletedAt: nowIso(), reason: "summarized_older_than_retention_days" };
       moved.push(record.messageId);
     } catch (err) {
       console.warn("Move summarized message failed", record.messageId, err.message);
