@@ -102,26 +102,30 @@ function cleanSubject(subject = "") {
 }
 
 export async function testImapConnection() {
-  if (!isImapConfigured()) return { ok: false, error: "IMAP is not configured" };
+  if (!isImapConfigured()) {
+    return { ok: false, error: "IMAP is not configured" };
+  }
+
   const client = createClient();
   await client.connect();
+
   try {
     const info = getImapAccountInfo();
-    const mailboxes = [];
-    for await (const box of client.list()) {
-      mailboxes.push({ path: box.path, name: box.name, flags: box.flags || [] });
-    }
+
     const lock = await client.getMailboxLock(info.inboxMailbox);
     try {
-      const status = await client.status(info.inboxMailbox, { messages: true, unseen: true });
+      const status = await client.status(info.inboxMailbox, {
+        messages: true,
+        unseen: true
+      });
+
       return {
         ok: true,
         account: info.email,
         host: info.host,
         inboxMailbox: info.inboxMailbox,
         messages: status.messages || 0,
-        unseen: status.unseen || 0,
-        mailboxes
+        unseen: status.unseen || 0
       };
     } finally {
       lock.release();
