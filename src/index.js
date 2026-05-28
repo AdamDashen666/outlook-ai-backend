@@ -53,6 +53,23 @@ function positiveInt(value, fallback, max) {
   return Math.min(Math.floor(number), max);
 }
 
+function getSummaryMode(body = {}) {
+  return body?.mode === "scheduled" ? "scheduled" : "test";
+}
+
+function sendSummaryJson(res, payload, status = 200) {
+  return res.status(status).type("application/json").json(payload);
+}
+
+function sendSummaryError(res, body, error, status = 200) {
+  return sendSummaryJson(res, {
+    ok: false,
+    mode: getSummaryMode(body),
+    processed: 0,
+    error: error?.message || String(error || "Request failed")
+  }, status);
+}
+
 function getScheduledOptionsForUser(user) {
   const frequency = user?.settings?.frequency || "daily";
   if (frequency === "sixHours") {
@@ -65,7 +82,7 @@ function getScheduledOptionsForUser(user) {
 }
 
 function normalizeSummaryOptions(body = {}, user = null) {
-  const mode = body.mode === "scheduled" ? "scheduled" : "test";
+  const mode = getSummaryMode(body);
 
   if (mode === "test") {
     return {
@@ -357,20 +374,32 @@ app.get("/summaries", (req, res) => {
 });
 
 app.post("/summarize/run", async (req, res) => {
+  const body = req.body || {};
+  res.type("application/json");
+
   try {
-    const { deviceId } = req.body || {};
+    const { deviceId } = body;
+    const mode = getSummaryMode(body);
     const store = loadStore();
     const device = store.devices[deviceId];
-    if (!device?.userId) return res.status(400).json({ ok: false, error: "Device not linked" });
+
+    if (!device?.userId) {
+      return sendSummaryJson(res, {
+        ok: false,
+        mode,
+        processed: 0,
+        error: "Device not linked"
+      });
+    }
 
     const user = store.users[device.userId];
-    const options = normalizeSummaryOptions(req.body || {}, user);
+    const options = normalizeSummaryOptions(body, user);
     const result = await runSummaryForUser(user, device, store, options);
 
     saveStore(store);
 
     if (!result.ok && result.processed === 0) {
-      return res.json({
+      return sendSummaryJson(res, {
         ok: false,
         mode: result.mode,
         processed: 0,
@@ -378,17 +407,16 @@ app.post("/summarize/run", async (req, res) => {
       });
     }
 
-    res.json({
+    return sendSummaryJson(res, {
       ok: true,
       mode: result.mode,
       processed: result.processed,
       summary: result.content,
-      hasMore: result.hasMore,
-      summaryId: result.summaryRecord?.id
+      hasMore: Boolean(result.hasMore)
     });
   } catch (err) {
-    console.error(err);
-    res.json({ ok: false, error: err.message });
+    console.error("Summarize run failed", err);
+    return sendSummaryError(res, body, err);
   }
 });
 
@@ -540,6 +568,20 @@ async function schedulerTick() {
   }
   saveStore(store);
 }
+
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+
+  console.error("Unhandled request error", err);
+  if (req.path === "/summarize/run") {
+    return sendSummaryError(res, req.body || {}, err);
+  }
+
+  return res.status(500).type("application/json").json({
+    ok: false,
+    error: err?.message || "Internal server error"
+  });
+});
 
 setInterval(schedulerTick, 15 * 60 * 1000);
 setTimeout(schedulerTick, 2000);
