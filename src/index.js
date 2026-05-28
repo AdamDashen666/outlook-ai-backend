@@ -17,7 +17,6 @@ import {
   getImapAccountInfo,
   testImapConnection,
   getUnreadImapMessagesForSummary,
-  markImapMessageSummarized,
   cleanupImapMessages
 } from "./imapMail.js";
 import { summarizeMessages, getAiConfig } from "./ai.js";
@@ -33,6 +32,7 @@ const PERMANENT_DELETE_AFTER_DAYS = Number(process.env.PERMANENT_DELETE_AFTER_DA
 const AUTO_DELETE_ENABLED = String(process.env.AUTO_DELETE_ENABLED ?? "true").toLowerCase() === "true";
 const MAIL_PROVIDER = String(process.env.MAIL_PROVIDER || "graph").toLowerCase();
 const USE_IMAP = MAIL_PROVIDER === "qq" || MAIL_PROVIDER === "imap";
+const SUMMARY_TIMEZONE = process.env.SUMMARY_TIMEZONE || "Asia/Shanghai";
 
 function makeId(prefix) {
   return `${prefix}_${crypto.randomBytes(12).toString("hex")}`;
@@ -70,6 +70,86 @@ function sendSummaryError(res, body, error, status = 200) {
   }, status);
 }
 
+function formatSummaryTime(date) {
+  const safeDate = date instanceof Date && !Number.isNaN(date.getTime()) ? date : new Date();
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: SUMMARY_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  }).formatToParts(safeDate);
+  const map = Object.fromEntries(parts.map(part => [part.type, part.value]));
+  const hour = map.hour === "24" ? "00" : map.hour;
+  return `${map.year}-${map.month}-${map.day} ${hour}:${map.minute}`;
+}
+
+function messageDate(message) {
+  const date = new Date(message?.receivedDateTime || 0);
+  return Number.isNaN(date.getTime()) ? new Date() : date;
+}
+
+function getMessageText(message) {
+  return `${message?.subject || ""} ${message?.from?.emailAddress?.name || ""} ${message?.from?.emailAddress?.address || ""} ${message?.bodyPreview || ""}`.toLowerCase();
+}
+
+function isSpamLike(message) {
+  if (message?.sourceFolder === "junkemail") return true;
+  const text = getMessageText(message);
+  return [
+    "unsubscribe", "newsletter", "promotion", "promo", "sale", "discount", "coupon",
+    "广告", "促销", "优惠", "折扣", "订阅", "营销", "推广", "newsletter", "digest"
+  ].some(keyword => text.includes(keyword));
+}
+
+function isImportantLike(message) {
+  if (isSpamLike(message)) return false;
+  const text = getMessageText(message);
+  return [
+    "urgent", "action required", "deadline", "due", "invoice", "payment", "security", "login", "verify",
+    "重要", "紧急", "截止", "到期", "账单", "发票", "付款", "支付", "确认", "回复", "登录", "安全", "账号", "验证码", "异常", "逾期"
+  ].some(keyword => text.includes(keyword));
+}
+
+function getMessageStats(messages) {
+  const spamCount = messages.filter(isSpamLike).length;
+  const importantCount = messages.filter(isImportantLike).length;
+  return { importantCount, spamCount };
+}
+
+function getSummaryTimeRange(messages, options) {
+  const now = new Date();
+  let startDate = now;
+  let endDate = now;
+
+  if (options.mode === "scheduled") {
+    const hours = positiveInt(options.windowHours, 24, 24 * 60);
+    startDate = new Date(now.getTime() - hours * 60 * 60 * 1000);
+    endDate = now;
+  } else if (messages.length > 0) {
+    const dates = messages.map(messageDate).sort((a, b) => a - b);
+    startDate = dates[0];
+    endDate = dates[dates.length - 1];
+  }
+
+  return {
+    startDate,
+    endDate,
+    startTime: formatSummaryTime(startDate),
+    endTime: formatSummaryTime(endDate)
+  };
+}
+
+function buildSummaryMeta(messages, options) {
+  return {
+    ...getSummaryTimeRange(messages, options),
+    ...getMessageStats(messages),
+    processedCount: messages.length
+  };
+}
+
 function getScheduledOptionsForUser(user) {
   const frequency = user?.settings?.frequency || "daily";
   if (frequency === "sixHours") {
@@ -87,7 +167,7 @@ function normalizeSummaryOptions(body = {}, user = null) {
   if (mode === "test") {
     return {
       mode: "test",
-      limit: positiveInt(body.limit, 3, 5)
+      latestCount: positiveInt(body.latestCount ?? body.limit, 3, 5)
     };
   }
 
@@ -95,19 +175,20 @@ function normalizeSummaryOptions(body = {}, user = null) {
   return {
     mode: "scheduled",
     windowHours: positiveInt(body.windowHours, defaults.windowHours, 24 * 60),
-    maxMessages: positiveInt(body.maxMessages, defaults.maxMessages, 100)
+    maxMessages: positiveInt(body.maxMessages, 30, 100)
   };
 }
 
-function filterMessagesByWindow(messages, options) {
+function filterMessagesByWindow(messages, options, store = null) {
   const mode = options.mode === "test" ? "test" : "scheduled";
-  const limit = mode === "test" ? positiveInt(options.limit, 3, 5) : positiveInt(options.maxMessages, 30, 100);
+  const limit = mode === "test" ? positiveInt(options.latestCount ?? options.limit, 3, 5) : positiveInt(options.maxMessages, 30, 100);
   const cutoff = mode === "scheduled"
     ? Date.now() - positiveInt(options.windowHours, 24, 24 * 60) * 60 * 60 * 1000
     : null;
 
   const filtered = messages
     .filter(message => {
+      if (mode === "scheduled" && store?.summarizedMessages?.[message.id]) return false;
       if (!cutoff) return true;
       const receivedAt = new Date(message.receivedDateTime || 0).getTime();
       return Number.isFinite(receivedAt) && receivedAt >= cutoff;
@@ -118,6 +199,64 @@ function filterMessagesByWindow(messages, options) {
     messages: filtered.slice(0, limit),
     hasMore: filtered.length > limit
   };
+}
+
+function ensureImapDefaultUser(store, deviceId = "") {
+  if (!USE_IMAP || !isImapConfigured()) return null;
+
+  const info = getImapAccountInfo();
+  const userId = "imap_default_user";
+  const existingDevice = Object.values(store.devices || {}).find(device => device.userId === userId) || null;
+  const resolvedDeviceId = deviceId || existingDevice?.deviceId || "imap_default_device";
+
+  const device = {
+    ...(existingDevice || {}),
+    ...(store.devices?.[resolvedDeviceId] || {}),
+    deviceId: resolvedDeviceId,
+    userId,
+    platform: store.devices?.[resolvedDeviceId]?.platform || existingDevice?.platform || "Render",
+    deviceToken: store.devices?.[resolvedDeviceId]?.deviceToken || existingDevice?.deviceToken || "",
+    updatedAt: nowIso()
+  };
+
+  const currentUser = store.users[userId] || {};
+  const user = {
+    ...currentUser,
+    id: userId,
+    deviceId: resolvedDeviceId,
+    provider: info.provider,
+    imap: {
+      email: info.email,
+      host: info.host,
+      inboxMailbox: info.inboxMailbox,
+      junkMailbox: info.junkMailbox
+    },
+    settings: {
+      enabled: true,
+      frequency: "daily",
+      language: "zh-CN",
+      includeJunkUnread: Boolean(info.junkMailbox),
+      autoDeleteEnabled: true,
+      deleteAfterDays: DELETE_AFTER_DAYS,
+      permanentDeleteAfterDays: PERMANENT_DELETE_AFTER_DAYS,
+      ...stripAiSettings(currentUser.settings || {})
+    },
+    updatedAt: nowIso()
+  };
+
+  store.devices[resolvedDeviceId] = device;
+  store.users[userId] = user;
+
+  return { device, user };
+}
+
+function resolveSummaryTarget(store, deviceId = "") {
+  const device = store.devices?.[deviceId];
+  if (device?.userId && store.users?.[device.userId]) {
+    return { device, user: store.users[device.userId] };
+  }
+
+  return ensureImapDefaultUser(store, deviceId);
 }
 
 async function getFreshAccessToken(user, store) {
@@ -224,32 +363,16 @@ app.post("/devices/register", (req, res) => {
     };
 
     if (USE_IMAP && isImapConfigured()) {
-      const info = getImapAccountInfo();
-      const userId = "imap_default_user";
-      baseDevice.userId = userId;
-      store.users[userId] = {
-        ...(store.users[userId] || {}),
-        id: userId,
-        deviceId,
-        provider: info.provider,
-        imap: {
-          email: info.email,
-          host: info.host,
-          inboxMailbox: info.inboxMailbox,
-          junkMailbox: info.junkMailbox
-        },
-        settings: {
-          enabled: true,
-          frequency: "daily",
-          language: "zh-CN",
-          includeJunkUnread: Boolean(info.junkMailbox),
-          autoDeleteEnabled: true,
-          deleteAfterDays: DELETE_AFTER_DAYS,
-          permanentDeleteAfterDays: PERMANENT_DELETE_AFTER_DAYS,
-          ...stripAiSettings(store.users[userId]?.settings || {})
-        },
-        updatedAt: nowIso()
-      };
+      const resolved = ensureImapDefaultUser(store, deviceId);
+      if (resolved) {
+        baseDevice.userId = resolved.user.id;
+        store.devices[deviceId] = {
+          ...resolved.device,
+          ...baseDevice,
+          userId: resolved.user.id
+        };
+        return store.devices[deviceId];
+      }
     }
 
     store.devices[deviceId] = baseDevice;
@@ -327,8 +450,8 @@ app.get("/auth/callback", async (req, res) => {
 app.get("/auth/status", (req, res) => {
   const deviceId = String(req.query.deviceId || "");
   const store = loadStore();
-  const device = store.devices[deviceId];
-  const user = device?.userId ? store.users[device.userId] : null;
+  const target = resolveSummaryTarget(store, deviceId);
+  const user = target?.user || null;
   res.json({
     linked: Boolean(user),
     user: user ? {
@@ -343,11 +466,11 @@ app.get("/auth/status", (req, res) => {
 app.post("/settings", (req, res) => {
   const { deviceId, settings = {} } = req.body || {};
   const result = updateStore(store => {
-    const device = store.devices[deviceId];
-    if (!device?.userId || !store.users[device.userId]) throw new Error("Device not linked");
-    const current = stripAiSettings(store.users[device.userId].settings || {});
+    const target = resolveSummaryTarget(store, deviceId);
+    if (!target?.user) throw new Error("Device not linked");
+    const current = stripAiSettings(target.user.settings || {});
     const safeSettings = stripAiSettings(settings);
-    store.users[device.userId].settings = {
+    store.users[target.user.id].settings = {
       ...current,
       ...safeSettings,
       language: "zh-CN",
@@ -356,8 +479,8 @@ app.post("/settings", (req, res) => {
       deleteAfterDays: Number(safeSettings.deleteAfterDays || current.deleteAfterDays || DELETE_AFTER_DAYS),
       permanentDeleteAfterDays: Number(safeSettings.permanentDeleteAfterDays || current.permanentDeleteAfterDays || PERMANENT_DELETE_AFTER_DAYS)
     };
-    store.users[device.userId].updatedAt = nowIso();
-    return store.users[device.userId].settings;
+    store.users[target.user.id].updatedAt = nowIso();
+    return store.users[target.user.id].settings;
   });
   res.json({ ok: true, settings: result });
 });
@@ -365,9 +488,9 @@ app.post("/settings", (req, res) => {
 app.get("/summaries", (req, res) => {
   const deviceId = String(req.query.deviceId || "");
   const store = loadStore();
-  const device = store.devices[deviceId];
+  const target = resolveSummaryTarget(store, deviceId);
   const list = Object.values(store.summaries)
-    .filter(s => s.userId === device?.userId)
+    .filter(s => s.userId === target?.user?.id)
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
     .slice(0, 30);
   res.json({ summaries: list });
@@ -378,12 +501,12 @@ app.post("/summarize/run", async (req, res) => {
   res.type("application/json");
 
   try {
-    const { deviceId } = body;
+    const { deviceId = "" } = body;
     const mode = getSummaryMode(body);
     const store = loadStore();
-    const device = store.devices[deviceId];
+    const target = resolveSummaryTarget(store, deviceId);
 
-    if (!device?.userId) {
+    if (!target?.user || !target?.device) {
       return sendSummaryJson(res, {
         ok: false,
         mode,
@@ -392,9 +515,8 @@ app.post("/summarize/run", async (req, res) => {
       });
     }
 
-    const user = store.users[device.userId];
-    const options = normalizeSummaryOptions(body, user);
-    const result = await runSummaryForUser(user, device, store, options);
+    const options = normalizeSummaryOptions(body, target.user);
+    const result = await runSummaryForUser(target.user, target.device, store, options);
 
     saveStore(store);
 
@@ -403,7 +525,7 @@ app.post("/summarize/run", async (req, res) => {
         ok: false,
         mode: result.mode,
         processed: 0,
-        message: result.message || "没有可总结的新邮件"
+        message: result.message
       });
     }
 
@@ -412,6 +534,10 @@ app.post("/summarize/run", async (req, res) => {
       mode: result.mode,
       processed: result.processed,
       summary: result.content,
+      startTime: result.startTime,
+      endTime: result.endTime,
+      importantCount: result.importantCount,
+      spamCount: result.spamCount,
       hasMore: Boolean(result.hasMore)
     });
   } catch (err) {
@@ -422,11 +548,22 @@ app.post("/summarize/run", async (req, res) => {
 
 async function getMessagesForSummary(user, store, options) {
   if (USE_IMAP) {
-    return getUnreadImapMessagesForSummary(options);
+    const result = await getUnreadImapMessagesForSummary(options);
+    if (options.mode !== "scheduled") return result;
+
+    const limit = positiveInt(options.maxMessages, 30, 100);
+    const filtered = result.messages
+      .filter(message => !store.summarizedMessages?.[message.id])
+      .sort((a, b) => new Date(b.receivedDateTime || 0) - new Date(a.receivedDateTime || 0));
+
+    return {
+      messages: filtered.slice(0, limit),
+      hasMore: Boolean(result.hasMore || filtered.length > limit)
+    };
   }
 
   const allMessages = await getUnreadMessages(await getFreshAccessToken(user, store));
-  return filterMessagesByWindow(allMessages, options);
+  return filterMessagesByWindow(allMessages, options, store);
 }
 
 async function runSummaryForUser(user, device, store, options = getScheduledOptionsForUser(user)) {
@@ -441,21 +578,15 @@ async function runSummaryForUser(user, device, store, options = getScheduledOpti
       mode,
       processed: 0,
       hasMore: false,
-      message: "没有可总结的新邮件"
+      message: mode === "test" ? "没有可总结的邮件" : "当前时间范围内没有可总结的新邮件"
     };
   }
 
-  const content = await summarizeMessages(messages, user.settings);
+  const meta = buildSummaryMeta(messages, summaryOptions);
+  const content = await summarizeMessages(messages, user.settings, meta);
 
-  for (const message of messages) {
-    try {
-      if (USE_IMAP) {
-        await markImapMessageSummarized(message);
-      } else {
-        const accessToken = await getFreshAccessToken(user, store);
-        await markMessageSummarized(accessToken, message);
-      }
-
+  if (mode === "scheduled") {
+    for (const message of messages) {
       store.summarizedMessages[message.id] = {
         userId: user.id,
         messageId: message.id,
@@ -467,9 +598,9 @@ async function runSummaryForUser(user, device, store, options = getScheduledOpti
         sourceFolder: message.sourceFolder,
         provider: USE_IMAP ? "imap" : "graph"
       };
-    } catch (err) {
-      console.warn("Failed to mark summarized", message.id, err.message);
     }
+    user.lastRunAt = nowIso();
+    store.users[user.id] = user;
   }
 
   const title = USE_IMAP ? "QQ 邮箱邮件总结" : "Outlook 邮件总结";
@@ -482,6 +613,10 @@ async function runSummaryForUser(user, device, store, options = getScheduledOpti
     mode,
     processed,
     hasMore,
+    startTime: meta.startTime,
+    endTime: meta.endTime,
+    importantCount: meta.importantCount,
+    spamCount: meta.spamCount,
     unreadCount: processed,
     junkUnreadCount: messages.filter(m => m.sourceFolder === "junkemail").length,
     windowHours: summaryOptions.windowHours || null,
@@ -489,15 +624,20 @@ async function runSummaryForUser(user, device, store, options = getScheduledOpti
   };
 
   store.summaries[summaryId] = summary;
-  user.lastRunAt = nowIso();
-  store.users[user.id] = user;
 
-  await sendSummaryPush(device.deviceToken, title, trimPushBody(content), summaryId);
+  if (mode === "scheduled") {
+    await sendSummaryPush(device.deviceToken, title, trimPushBody(content), summaryId);
+  }
+
   return {
     ok: true,
     mode,
     processed,
     content,
+    startTime: meta.startTime,
+    endTime: meta.endTime,
+    importantCount: meta.importantCount,
+    spamCount: meta.spamCount,
     hasMore,
     summaryRecord: summary
   };
