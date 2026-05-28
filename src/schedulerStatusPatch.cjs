@@ -46,8 +46,17 @@ function makeSyncId() {
   return `summary_sync_${crypto.randomBytes(12).toString("hex")}`;
 }
 
+function retentionMs(days = SYNC_RETENTION_DAYS) {
+  return Number(days || 7) * 24 * 60 * 60 * 1000;
+}
+
 function cutoffMs(days = SYNC_RETENTION_DAYS) {
-  return Date.now() - Number(days || 7) * 24 * 60 * 60 * 1000;
+  return Date.now() - retentionMs(days);
+}
+
+function getTimestamp(value) {
+  const time = new Date(value || 0).getTime();
+  return Number.isFinite(time) ? time : 0;
 }
 
 function cleanupSyncQueue(store) {
@@ -55,8 +64,17 @@ function cleanupSyncQueue(store) {
   const cutoff = cutoffMs(SYNC_RETENTION_DAYS);
 
   for (const [id, record] of Object.entries(store.summarySyncQueue)) {
-    const createdAt = new Date(record.createdAt || 0).getTime();
-    if (!Number.isFinite(createdAt) || createdAt < cutoff) {
+    const createdAt = getTimestamp(record.createdAt);
+    const syncedAt = getTimestamp(record.syncedAt);
+
+    // Unsynced records are temporary and retained for up to 7 days.
+    if (!record.synced && createdAt < cutoff) {
+      delete store.summarySyncQueue[id];
+      continue;
+    }
+
+    // Synced records are kept briefly for recovery, then removed after 7 days.
+    if (record.synced && (syncedAt || createdAt) < cutoff) {
       delete store.summarySyncQueue[id];
     }
   }
@@ -84,9 +102,9 @@ function sanitizeSummaryRecord(record) {
   };
 }
 
-function publicSummaryRecord(record) {
+function publicSummaryRecord(record, { includeSyncState = true } = {}) {
   const safe = sanitizeSummaryRecord(record);
-  return {
+  const publicRecord = {
     id: safe.id,
     createdAt: safe.createdAt,
     mode: safe.mode,
@@ -98,6 +116,13 @@ function publicSummaryRecord(record) {
     summary: safe.summary,
     structured: safe.structured
   };
+
+  if (includeSyncState) {
+    publicRecord.synced = safe.synced;
+    publicRecord.syncedAt = safe.syncedAt;
+  }
+
+  return publicRecord;
 }
 
 function saveSuccessfulSummaryPayload(payload) {
@@ -118,7 +143,8 @@ function saveSuccessfulSummaryPayload(payload) {
     spamCount: payload.spamCount,
     summary: payload.summary,
     structured: payload.structured,
-    synced: false
+    synced: false,
+    syncedAt: null
   });
 
   saveStore(store);
@@ -146,10 +172,10 @@ function listSyncSummaries({ pendingOnly = false, days = null } = {}) {
   const cutoff = days ? cutoffMs(days) : 0;
   return Object.values(store.summarySyncQueue || {})
     .map(sanitizeSummaryRecord)
-    .filter(record => !pendingOnly || !record.synced)
-    .filter(record => !days || new Date(record.createdAt).getTime() >= cutoff)
-    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
-    .map(publicSummaryRecord);
+    .filter(record => pendingOnly ? record.synced === false : true)
+    .filter(record => !days || getTimestamp(record.createdAt) >= cutoff)
+    .sort((a, b) => getTimestamp(b.createdAt) - getTimestamp(a.createdAt))
+    .map(record => publicSummaryRecord(record, { includeSyncState: true }));
 }
 
 function markSummariesSynced(ids = []) {
@@ -159,12 +185,19 @@ function markSummariesSynced(ids = []) {
 
   let marked = 0;
   const now = nowIso();
-  for (const id of Array.isArray(ids) ? ids : []) {
-    const key = String(id || "");
-    if (!key || !store.summarySyncQueue[key]) continue;
-    if (!store.summarySyncQueue[key].synced) marked += 1;
-    store.summarySyncQueue[key].synced = true;
-    store.summarySyncQueue[key].syncedAt = now;
+  const uniqueIds = [...new Set((Array.isArray(ids) ? ids : []).map(id => String(id || "")).filter(Boolean))];
+
+  for (const id of uniqueIds) {
+    if (!store.summarySyncQueue[id]) continue;
+
+    if (!store.summarySyncQueue[id].synced) {
+      marked += 1;
+      store.summarySyncQueue[id].syncedAt = now;
+    } else if (!store.summarySyncQueue[id].syncedAt) {
+      store.summarySyncQueue[id].syncedAt = now;
+    }
+
+    store.summarySyncQueue[id].synced = true;
   }
 
   cleanupSyncQueue(store);
