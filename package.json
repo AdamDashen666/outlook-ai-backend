@@ -4,8 +4,8 @@
   "type": "module",
   "main": "src/index.js",
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "start": "node -r ./src/schedulerStatusPatch.cjs src/index.js",
+    "dev": "node -r ./src/schedulerStatusPatch.cjs --watch src/index.js"
   },
   "dependencies": {
     "@parse/node-apn": "latest",
