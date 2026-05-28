@@ -150,6 +150,35 @@ function buildSummaryMeta(messages, options) {
   };
 }
 
+function buildStructuredFallback(messages, meta) {
+  return {
+    title: "邮件总结",
+    timeRange: {
+      start: meta.startTime,
+      end: meta.endTime
+    },
+    counts: {
+      processed: messages.length,
+      important: meta.importantCount,
+      spam: meta.spamCount
+    },
+    reminders: messages.length ? ["请查看本次邮件总结中的重点内容。"] : ["无"],
+    importantEmails: messages.slice(0, Math.min(messages.length, 8)).map(message => ({
+      sender: message.from?.emailAddress?.name || message.from?.emailAddress?.address || "未知发件人",
+      subject: message.subject || "无标题",
+      time: message.receivedDateTime || "未知",
+      summary: String(message.bodyPreview || "无").replace(/\s+/g, " ").slice(0, 160) || "无",
+      action: "查看",
+      deadline: "无",
+      priority: isImportantLike(message) ? "高" : "中"
+    })),
+    normalEmailsSummary: ["其余邮件为普通通知或常规信息。"],
+    spamSummary: meta.spamCount ? ["存在广告、促销、订阅通知或低价值邮件。"] : ["无"],
+    risks: ["暂无明显风险"],
+    nextSteps: ["优先处理高优先级和涉及账号、安全、付款或截止时间的邮件。"]
+  };
+}
+
 function getScheduledOptionsForUser(user) {
   const frequency = user?.settings?.frequency || "daily";
   if (frequency === "sixHours") {
@@ -538,7 +567,8 @@ app.post("/summarize/run", async (req, res) => {
       endTime: result.endTime,
       importantCount: result.importantCount,
       spamCount: result.spamCount,
-      hasMore: Boolean(result.hasMore)
+      hasMore: Boolean(result.hasMore),
+      structured: result.structured
     });
   } catch (err) {
     console.error("Summarize run failed", err);
@@ -583,7 +613,11 @@ async function runSummaryForUser(user, device, store, options = getScheduledOpti
   }
 
   const meta = buildSummaryMeta(messages, summaryOptions);
-  const content = await summarizeMessages(messages, user.settings, meta);
+  const aiSummary = await summarizeMessages(messages, user.settings, meta);
+  const content = typeof aiSummary === "string" ? aiSummary : aiSummary.summary;
+  const structured = typeof aiSummary === "object" && aiSummary?.structured
+    ? aiSummary.structured
+    : buildStructuredFallback(messages, meta);
 
   if (mode === "scheduled") {
     for (const message of messages) {
@@ -610,6 +644,7 @@ async function runSummaryForUser(user, device, store, options = getScheduledOpti
     userId: user.id,
     title,
     content,
+    structured,
     mode,
     processed,
     hasMore,
@@ -634,6 +669,7 @@ async function runSummaryForUser(user, device, store, options = getScheduledOpti
     mode,
     processed,
     content,
+    structured,
     startTime: meta.startTime,
     endTime: meta.endTime,
     importantCount: meta.importantCount,
