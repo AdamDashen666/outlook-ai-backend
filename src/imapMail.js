@@ -157,6 +157,34 @@ async function parsePreview(source) {
   }
 }
 
+function buildMessageFromFetchItem(item, mailbox, sourceFolder) {
+  const receivedDate = toDate(item.envelope?.date || item.internalDate);
+  const from = firstEnvelopeAddress(item.envelope?.from);
+
+  return {
+    id: `imap_${mailbox}_${item.uid}`,
+    uid: item.uid,
+    mailbox,
+    sourceFolder,
+    subject: cleanSubject(item.envelope?.subject || ""),
+    from: {
+      emailAddress: {
+        name: from.name,
+        address: from.address
+      }
+    },
+    receivedDateTime: receivedDate.toISOString(),
+    bodyPreview: "",
+    originalForwarded: false,
+    originalHeaders: {
+      from: null,
+      subject: "",
+      date: "",
+      to: ""
+    }
+  };
+}
+
 export async function testImapConnection() {
   if (!isImapConfigured()) {
     return { ok: false, error: "IMAP is not configured" };
@@ -191,6 +219,37 @@ export async function testImapConnection() {
   }
 }
 
+async function fetchLatestCandidatesFromMailbox(client, mailbox, sourceFolder, options = {}) {
+  const { candidateLimit = 6 } = options;
+  const lock = await client.getMailboxLock(mailbox);
+
+  try {
+    const total = Number(client.mailbox?.exists || 0);
+    if (!total) return { candidates: [], hasMore: false };
+
+    const startSeq = Math.max(1, total - candidateLimit + 1);
+    const sequenceRange = `${startSeq}:*`;
+    const candidates = [];
+
+    for await (const item of client.fetch(sequenceRange, {
+      uid: true,
+      envelope: true,
+      internalDate: true,
+      flags: true,
+      size: true
+    })) {
+      candidates.push(buildMessageFromFetchItem(item, mailbox, sourceFolder));
+    }
+
+    return {
+      candidates,
+      hasMore: total > candidateLimit
+    };
+  } finally {
+    lock.release();
+  }
+}
+
 async function fetchUnseenCandidatesFromMailbox(client, mailbox, sourceFolder, options = {}) {
   const { cutoffDate = null, candidateLimit = 31 } = options;
   const lock = await client.getMailboxLock(mailbox);
@@ -214,32 +273,9 @@ async function fetchUnseenCandidatesFromMailbox(client, mailbox, sourceFolder, o
       flags: true,
       size: true
     }, { uid: true })) {
-      const receivedDate = toDate(item.envelope?.date || item.internalDate);
-      if (cutoffDate && receivedDate.getTime() < cutoffDate.getTime()) continue;
-
-      const from = firstEnvelopeAddress(item.envelope?.from);
-      candidates.push({
-        id: `imap_${mailbox}_${item.uid}`,
-        uid: item.uid,
-        mailbox,
-        sourceFolder,
-        subject: cleanSubject(item.envelope?.subject || ""),
-        from: {
-          emailAddress: {
-            name: from.name,
-            address: from.address
-          }
-        },
-        receivedDateTime: receivedDate.toISOString(),
-        bodyPreview: "",
-        originalForwarded: false,
-        originalHeaders: {
-          from: null,
-          subject: "",
-          date: "",
-          to: ""
-        }
-      });
+      const message = buildMessageFromFetchItem(item, mailbox, sourceFolder);
+      if (cutoffDate && new Date(message.receivedDateTime).getTime() < cutoffDate.getTime()) continue;
+      candidates.push(message);
     }
 
     return {
@@ -315,13 +351,13 @@ export async function getUnreadImapMessagesForSummary(options = {}) {
 
   const mode = options.mode === "test" ? "test" : "scheduled";
   const limit = mode === "test"
-    ? positiveInt(options.limit, 3, 5)
+    ? positiveInt(options.latestCount ?? options.limit, 3, 5)
     : positiveInt(options.maxMessages, 30, 100);
   const windowHours = mode === "scheduled"
     ? positiveInt(options.windowHours, 24, 24 * 60)
     : null;
   const cutoffDate = windowHours ? new Date(Date.now() - windowHours * 60 * 60 * 1000) : null;
-  const candidateLimit = limit + 1;
+  const candidateLimit = mode === "scheduled" ? Math.min(limit * 3 + 1, 301) : limit + 1;
 
   const client = createClient();
   const info = getImapAccountInfo();
@@ -331,7 +367,9 @@ export async function getUnreadImapMessagesForSummary(options = {}) {
     const allCandidates = [];
     let hasMore = false;
 
-    const inboxResult = await fetchUnseenCandidatesFromMailbox(client, info.inboxMailbox, "inbox", {
+    const fetchMailbox = mode === "test" ? fetchLatestCandidatesFromMailbox : fetchUnseenCandidatesFromMailbox;
+
+    const inboxResult = await fetchMailbox(client, info.inboxMailbox, "inbox", {
       cutoffDate,
       candidateLimit
     });
@@ -340,7 +378,7 @@ export async function getUnreadImapMessagesForSummary(options = {}) {
 
     if (info.junkMailbox) {
       try {
-        const junkResult = await fetchUnseenCandidatesFromMailbox(client, info.junkMailbox, "junkemail", {
+        const junkResult = await fetchMailbox(client, info.junkMailbox, "junkemail", {
           cutoffDate,
           candidateLimit
         });
@@ -352,9 +390,10 @@ export async function getUnreadImapMessagesForSummary(options = {}) {
     }
 
     allCandidates.sort((a, b) => new Date(b.receivedDateTime) - new Date(a.receivedDateTime));
-    if (allCandidates.length > limit) hasMore = true;
+    const selectedLimit = mode === "scheduled" ? candidateLimit : limit;
+    if (allCandidates.length > selectedLimit) hasMore = true;
 
-    const selected = allCandidates.slice(0, limit);
+    const selected = allCandidates.slice(0, selectedLimit);
     await attachPreviews(client, selected);
 
     return {
